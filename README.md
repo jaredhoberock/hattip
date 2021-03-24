@@ -1,0 +1,2 @@
+# hattip
+Pedagogical HTTP parser
