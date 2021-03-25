@@ -444,7 +444,6 @@ struct http_header
 };
 
 
-struct simple_response {};
 struct full_request {};
 
 struct entity_body : std::string
@@ -465,11 +464,16 @@ struct entity_body : std::string
 };
 
 
+// Simple-Response := [ Entity-Body ]
+// The optional [ ] part is redundant with Entity-Body because Entity-Body is allowed to be empty
+struct simple_response : entity_body {};
+
+
 struct full_response 
 {
   status_line sl;
   std::vector<http_header> headers;
-  std::optional<entity_body> body;
+  entity_body body;
 
   static constexpr const char* leftmost_token = status_line::leftmost_token;
 
@@ -492,13 +496,7 @@ struct full_response
 
     lex >> "\r" >> "\n";
 
-    if(!lex.peek().empty())
-    {
-      self.body.emplace();
-      lex >> *self.body;
-    }
-
-    return lex;
+    return lex >> self.body;
   }
 
 
@@ -511,14 +509,7 @@ struct full_response
       os << header;
     }
 
-    os << "\r\n";
-
-    if(self.body)
-    {
-      os << *self.body;
-    }
-
-    return os;
+    return os << "\r\n" << self.body;
   }
 };
 
@@ -526,7 +517,7 @@ struct full_response
 struct message
 {
   //std::variant<simple_request, simple_response, full_request, full_response> body;
-  std::variant<simple_request, full_response> body;
+  std::variant<simple_request, simple_response, full_response> body;
 
   // message := Simple-Request | Simple-Response | Full-Request | Full-Response
   friend lexer& operator>>(lexer& lex, message& self)
@@ -545,7 +536,10 @@ struct message
     }
     else
     {
-      throw std::runtime_error{"Unexpected input"};
+      // simple_response has no leftmost_token because it is possible for Simple-Response to be completely empty
+      simple_response sr;
+      lex >> sr;
+      self.body = sr;
     }
 
     return lex;
