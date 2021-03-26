@@ -85,6 +85,12 @@ const std::set<int> known_status_codes = {
 };
 
 
+inline bool is_known_status_code(int c)
+{
+  return contains(known_status_codes, c);
+}
+
+
 const std::set<char> tspecials = {
   '(',
   ')',
@@ -128,6 +134,29 @@ inline bool is_ctl(char ch)
 inline bool is_ctl(const std::string& s)
 {
   return s.size() == 1 and is_ctl(s.front());
+}
+
+
+const std::set<const char*> known_methods = {
+  "\"OPTIONS\"",
+  "\"GET\"",
+  "\"HEAD\"",
+  "\"POST\"",
+  "\"PUT\"",
+  "\"PATCH\"",
+  "\"COPY\"",
+  "\"MOVE\"",
+  "\"DELETE\"",
+  "\"LINK\"",
+  "\"UNLINK\"",
+  "\"TRACE\"",
+  "\"WRAPPED\"",
+};
+
+
+inline bool is_known_method(const char* s)
+{
+  return contains(known_methods, s);
 }
 
 
@@ -300,8 +329,136 @@ struct simple_request
   {
     return os << "GET" << " " << self.uri << "\r" << "\n";
   }
+};
 
-  static constexpr const char* leftmost_token = "GET";
+
+// LWS := [CRLF] 1*( SP | HT )
+inline bool is_lws(const std::string& s)
+{
+  int i = 0;
+
+  // skip past optional CRLF
+  if(s.size() >= 2)
+  {
+    if(s[i] == '\r' and s[i] == '\n')
+    {
+      i += 2;
+    }
+  }
+
+  // neither an empty string nor CRLF alone is lws
+  // there needs to be at least one character of white space
+  if(i == s.size())
+  {
+    return false;
+  }
+
+  for(; i != s.size(); ++i)
+  {
+    // any character besides SP or HT is not LWS
+    // horizontal tab is ASCII 9
+    if(s[i] != ' ' or s[i] != 9)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+// qdtext := <any CHAR except <"> and CTLs, but including LWS>
+inline bool is_qdtext(const std::string& s)
+{
+  if(is_lws(s)) return true;
+
+  if(s == "\"") return false;
+
+  if(is_ctl(s)) return false;
+
+  return true;
+}
+
+
+struct quoted_string : std::string
+{
+  // Quoted-String := <"> *(qdtext) <">
+  // qdtext := <any CHAR except <"> and CTLs, but including LWS>
+  friend lexer& operator>>(lexer& lex, quoted_string& self)
+  {
+    // open quote
+    lex >> "\"";
+    self += "\"";
+
+    // consume text until we encounter another "
+    std::string tmp;
+    while(lex.peek() != "\"")
+    {
+      if(!is_qdtext(lex.peek()))
+      {
+        throw std::runtime_error{"Expected qdtext"};
+      }
+
+      lex >> tmp;
+      self += tmp;
+    }
+
+    // close quote
+    lex >> "\"";
+    self += "\"";
+
+    return lex;
+  }
+};
+
+
+struct token : std::string
+{
+  // token := 1*<any CHAR except CTLs or tspecials>
+  friend lexer& operator>>(lexer& lex, token& self)
+  {
+    // slurp text until we encounter a CTL or tspecial
+    std::string tmp;
+    while(not is_ctl(lex.peek()) and not is_tspecial(lex.peek()))
+    {
+      lex >> tmp;
+      self += tmp;
+    }
+
+    if(self.empty())
+    {
+      throw std::runtime_error{"token: Expected at least one CHAR"};
+    }
+
+    return lex;
+  }
+};
+
+
+struct method : std::string
+{
+  // Method := <one of the known methods> | token
+  friend lexer& operator>>(lexer& lex, method& self)
+  {
+    if(lex.peek() == "\"")
+    {
+      quoted_string qs;
+      lex >> qs;
+
+      self.clear();
+      self += qs;
+    }
+    else
+    {
+      token extension_method_name;
+      lex >> extension_method_name;
+
+      self.clear();
+      self += extension_method_name;
+    }
+
+    return lex;
+  }
 };
 
 
@@ -309,8 +466,6 @@ struct http_version
 {
   int major;
   int minor;
-
-  static constexpr const char* leftmost_token = "HTTP";
 
   // HTTP-Version := "HTTP" "/" 1*DIGIT "." 1*DIGIT
   friend lexer& operator>>(lexer& lex, http_version& self)
@@ -321,6 +476,187 @@ struct http_version
   friend std::ostream& operator<<(std::ostream& os, const http_version& self)
   {
     return os << "HTTP" << "/" << self.major << "." << self.minor;
+  }
+};
+
+
+struct request_line
+{
+  method m;
+  request_uri uri;
+  http_version version;
+
+  // Request-Line := Method SP Request-URI SP HTTP-Version CRLF
+  friend lexer& operator>>(lexer& lex, request_line& self)
+  {
+    return lex >> self.m >> " " >> self.uri >> " " >> self.version >> "\r" >> "\n";
+  }
+
+  friend std::ostream& operator<<(std::ostream& os, const request_line& self)
+  {
+    return os << self.m << " " << self.uri << " " << self.version << "\r\n";
+  }
+};
+
+
+using field_name = token;
+
+
+struct http_header
+{
+  field_name name;
+  std::string value;
+
+  // HTTP-header := field-name ":" [ field-value ] CRLF
+  friend lexer& operator>>(lexer& lex, http_header& self)
+  {
+    lex >> self.name >> ":";
+
+    // consume text until we encounter carriage return
+    std::string tmp;
+    while(lex.peek() != "\r")
+    {
+      lex >> tmp;
+      self.value += tmp;
+    }
+
+    return lex >> "\r" >> "\n";
+  }
+
+  friend std::ostream& operator<<(std::ostream& os, const http_header& self)
+  {
+    return os << self.name << ":" << self.value << "\r" << "\n";
+  }
+};
+
+
+struct http_headers
+{
+  std::vector<http_header> body;
+
+  // HTTP-Headers := *( General-Header
+  //                  | Request-Header
+  //                  | Entity-Header )
+  //                  CRLF
+  friend lexer& operator>>(lexer& lex, http_headers& self)
+  {
+    // read headers until we encounter a carriage return
+    while(lex.peek() != "\r")
+    {
+      self.body.push_back({});
+      lex >> self.body.back();
+    }
+
+    lex >> "\r" >> "\n";
+
+    return lex;
+  }
+
+  friend std::ostream& operator<<(std::ostream& os, const http_headers& self)
+  {
+    for(const auto& header : self.body)
+    {
+      os << header;
+    }
+
+    return os << "\r\n";
+  }
+};
+
+
+struct entity_body : std::string
+{
+  // Entity-Body := *OCTET
+  friend lexer& operator>>(lexer& lex, entity_body& self)
+  {
+    // consume input until eof
+    std::string tmp;
+    while(not lex.peek().empty())
+    {
+      lex >> tmp;
+      self += tmp;
+    }
+
+    return lex;
+  }
+};
+
+
+struct full_request
+{
+  request_line rl;
+  http_headers headers;
+  entity_body body;
+
+  // Full-Request := Request-Line
+  //                 HTTP-Headers
+  //                 [ Entity-Body ]
+  friend lexer& operator>>(lexer& lex, full_request& self)
+  {
+    return lex >> self.rl >> self.headers >> self.body;
+  }
+
+  friend std::ostream& operator<<(std::ostream& os, const full_request& self)
+  {
+    return os << self.rl << self.headers << self.body;
+  }
+};
+
+
+struct request
+{
+  std::variant<simple_request, full_request> body;
+
+  // Request := Simple-Request | Full-Request
+  friend lexer& operator>>(lexer& lex, request& self)
+  {
+    method m;
+    request_uri uri;
+
+    // the first four tokens of simple & full request are the same
+    lex >> m >> " " >> uri >> " ";
+
+    // if HTTP-Version comes next, it's a Full-Request
+    if(lex.peek() == "HTTP")
+    {
+      // read the HTTP-Version
+      http_version version;
+      lex >> version;
+
+      // assemble the Request-Line
+      request_line rl{m, uri, version};
+
+      // read the HTTP-Headers and Entity-Body
+      http_headers headers;
+      entity_body eb;
+      lex >> headers >> eb;
+
+      self.body = full_request{rl, headers, eb};
+    }
+    else
+    {
+      // else, CRLF must come next and it's a Simple-Request
+      // and method must be "GET"
+      lex >> "\r" >> "\n";
+      if(m != "\"GET\"")
+      {
+        throw std::runtime_error{"Expected \"GET\""};
+      }
+
+      self.body = simple_request{uri};
+    }
+
+    return lex;
+  }
+
+  friend std::ostream& operator<<(std::ostream& os, const request& self)
+  {
+    std::visit([&os](const auto& body) mutable
+    {
+      os << body;
+    }, self.body);
+
+    return os;
   }
 };
 
@@ -336,7 +672,7 @@ struct status_code
 
     lex >> self.number;
 
-    if(!contains(known_status_codes, self.number) or num_digits != 3)
+    if(!is_known_status_code(self.number) or num_digits != 3)
     {
       throw std::runtime_error{"Unexpected status code number"};
     }
@@ -375,8 +711,6 @@ struct status_line
   status_code code;
   reason_phrase reason;
 
-  static constexpr const char* leftmost_token = http_version::leftmost_token;
-
   // Status-Line := HTTP-Version SP Status-Code SP Reason-Phrase CRLF
   friend lexer& operator>>(lexer& lex, status_line& self)
   {
@@ -390,80 +724,6 @@ struct status_line
 };
 
 
-struct token : std::string
-{
-  // token := 1*<any CHAR except CTLs or tspecials>
-  friend lexer& operator>>(lexer& lex, token& self)
-  {
-    // slurp text until we encounter a CTL or tspecial
-    std::string tmp;
-    while(not is_ctl(lex.peek()) and not is_tspecial(lex.peek()))
-    {
-      lex >> tmp;
-      self += tmp;
-    }
-
-    if(self.empty())
-    {
-      throw std::runtime_error{"token: Expected at least one CHAR"};
-    }
-
-    return lex;
-  }
-};
-
-
-using field_name = token;
-
-
-struct http_header
-{
-  field_name name;
-  std::string value;
-
-  // HTTP-header := field-name ":" [ field-value ] CRLF
-  friend lexer& operator>>(lexer& lex, http_header& self)
-  {
-    lex >> self.name >> ":";
-
-    // consume text until we encounter carriage return
-    std::string tmp;
-    while(lex.peek() != "\r")
-    {
-      lex >> tmp;
-      self.value += tmp;
-    }
-
-    return lex >> "\r" >> "\n";
-  }
-
-  friend std::ostream& operator<<(std::ostream& os, const http_header& self)
-  {
-    return os << self.name << ":" << self.value << "\r" << "\n";
-  }
-};
-
-
-struct full_request {};
-
-struct entity_body : std::string
-{
-  // Entity-Body := *OCTET
-  friend lexer& operator>>(lexer& lex, entity_body& self)
-  {
-    // consume input until eof
-    std::string tmp;
-    while(not lex.peek().empty())
-    {
-      lex >> tmp;
-      self += tmp;
-    }
-
-    return lex;
-  }
-};
-
-
 // Simple-Response := [ Entity-Body ]
 // The optional [ ] part is redundant with Entity-Body because Entity-Body is allowed to be empty
 struct simple_response : entity_body {};
@@ -472,71 +732,61 @@ struct simple_response : entity_body {};
 struct full_response 
 {
   status_line sl;
-  std::vector<http_header> headers;
+  http_headers headers;
   entity_body body;
 
-  static constexpr const char* leftmost_token = status_line::leftmost_token;
-
   // Full-Response := Status-Line
-  //                  *( General-Header
-  //                   | Reponse-Header
-  //                   | Entity-Header )
-  //                  CRLF
+  //                  HTTP-Headers
   //                  [ Entity-Body ]
   friend lexer& operator>>(lexer& lex, full_response& self)
   {
-    lex >> self.sl;
-
-    // read headers until we encounter a carriage return
-    while(lex.peek() != "\r")
-    {
-      self.headers.push_back({});
-      lex >> self.headers.back();
-    }
-
-    lex >> "\r" >> "\n";
-
-    return lex >> self.body;
+    return lex >> self.sl >> self.headers >> self.body;
   }
 
 
   friend std::ostream& operator<<(std::ostream& os, const full_response& self)
   {
-    os << self.sl;
-
-    for(const auto& header : self.headers)
-    {
-      os << header;
-    }
-
-    return os << "\r\n" << self.body;
+    return os << self.sl << self.headers << self.body;
   }
 };
 
 
 struct message
 {
-  //std::variant<simple_request, simple_response, full_request, full_response> body;
-  std::variant<simple_request, simple_response, full_response> body;
+  std::variant<full_response, request, simple_response> body;
 
-  // message := Simple-Request | Simple-Response | Full-Request | Full-Response
+  // the spec defines it as:
+  // Message := Simple-Request | Simple-Response | Full-Request | Full-Response
+  //
+  // we implement it here as:
+  // Message := Full-Reponse | Request | Simple-Response
   friend lexer& operator>>(lexer& lex, message& self)
   {
-    if(lex.peek() == simple_request::leftmost_token)
-    {
-      simple_request sr;
-      lex >> sr;
-      self.body = sr;
-    }
-    else if(lex.peek() == full_response::leftmost_token)
+    if(lex.peek() == "HTTP")
     {
       full_response fr;
       lex >> fr;
       self.body = fr;
     }
+    else if(!lex.peek().empty())
+    {
+      // Simple-Response is allowed to be completely empty
+      //
+      // XXX this isn't quite right because we could predict that
+      //     a Request is coming that turns out to actually be a Simple-Response
+      //
+      // to fix this, we'd need to attempt to read the Request-Line and HTTP-Headers
+      // If that failed, we'd need to backtrack somehow and parse a Simple-Response instead
+      //
+      // maybe we could throw a string containing the consumed portion of the input
+      // to reconstruct the consumed input, we could serialize the partially-successful parse
+
+      request req;
+      lex >> req;
+      self.body = req;
+    }
     else
     {
-      // simple_response has no leftmost_token because it is possible for Simple-Response to be completely empty
       simple_response sr;
       lex >> sr;
       self.body = sr;
