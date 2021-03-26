@@ -285,18 +285,6 @@ struct lexer
 };
 
 
-void expect(const char* expected, lexer& lex)
-{
-  if(lex.peek() != expected)
-  {
-    auto what = std::string{"Expected \""} + expected + "\"";
-    throw std::runtime_error{what};
-  }
-
-  lex.next();
-}
-
-
 struct request_uri : public std::string
 {
   using std::string::string;
